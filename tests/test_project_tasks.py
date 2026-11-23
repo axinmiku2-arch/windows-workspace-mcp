@@ -26,11 +26,16 @@ class ProjectTasksTest(unittest.TestCase):
         sys.path.insert(0, str(stage / "runtime"))
         import core
         import project_tasks
+        import unified_workspace
         if core.STATE != state:
             raise RuntimeError("Run this suite in a fresh process so it cannot access another state directory")
-        cls.core, cls.tasks = core, project_tasks
+        cls.core, cls.tasks, cls.workspaces = core, project_tasks, unified_workspace
         cls.origin = "https://synthetic-project.invalid"
-        core.configure_local_relay(cls.origin, ["https://client.example.invalid/oauth/callback"])
+        callback = "https://client.example.invalid/oauth/callback"
+        core.configure_local_relay(cls.origin, [callback])
+        core.update_config(origin=cls.origin)
+        if core.local_oauth_callbacks() != [callback]:
+            raise RuntimeError("The isolated fixture did not bind the configured OAuth callback.")
         cls.counter = 0
 
     def setUp(self):
@@ -38,12 +43,11 @@ class ProjectTasksTest(unittest.TestCase):
         subroot = self.root / f"workspace-{self.counter}"
         self.folder = subroot / "project"
         self.folder.mkdir(parents=True)
-        self.cfg = {**self.core.DEFAULT,
-                    "origin": self.origin, "workspace_enabled": True, "workspace_unified": True,
-                    "workspace_root": str(self.folder), "workspace_revision": f"ws-{self.counter}",
-                    "approval_mode": "ask"}
-        self.core.save_json(self.core.CONFIG, self.cfg)
-        self.cfg = self.core.load_config()
+        self.cfg = self.workspaces.grant(str(self.folder), "ask")
+        self.assertTrue(self.cfg["workspace_enabled"])
+        self.assertTrue(self.cfg["task_enabled"])
+        self.assertTrue(self.cfg["workspace_revision"])
+        self.assertEqual(Path(self.cfg["task_scope"]), self.folder)
         self.runner = self.tasks.Runner()
         self.active = []
         self.addCleanup(self.finish_active)
@@ -124,9 +128,9 @@ class ProjectTasksTest(unittest.TestCase):
 
         revoked = self.start("python_build_check")["job_id"]
         self.tasks.decide(revoked, self.cfg, True)
-        current = {**self.cfg, "workspace_revision": "revoked"}
-        self.core.save_json(self.core.CONFIG, current)
-        current = self.core.load_config()
+        replacement = self.root / f"replacement-{self.counter}"
+        replacement.mkdir()
+        current = self.workspaces.grant(str(replacement), "ask")
         with self.assertRaisesRegex(ValueError, "current authorization"):
             self.tasks.status(revoked, current)
         last = self.wait_for(lambda: self.core.read_json(self.tasks.QUEUE / (revoked + ".json")),
@@ -192,8 +196,9 @@ class ProjectTasksTest(unittest.TestCase):
                 self.assertEqual(result.get("state"), "succeeded", result)
                 self.assertEqual(result["exit_code"], 0)
                 self.assertIn("local npm fixture: " + operation, result["stdout"])
-        self.assertEqual((self.folder / "build-result.txt").read_text(encoding="utf-8"),
-                         "local package output")
+        artifact = self.folder / "build-result.txt"
+        self.assertTrue(artifact.is_file(), "Approved npm build did not create the expected fixture output.")
+        self.assertEqual(artifact.read_text(encoding="utf-8"), "local package output")
 
     def test_cancel_stops_a_real_grandchild(self):
         fixture = """import pathlib

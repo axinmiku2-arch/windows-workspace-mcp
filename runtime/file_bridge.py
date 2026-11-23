@@ -6,7 +6,6 @@ import hashlib
 import hmac
 import json
 import mimetypes
-import msvcrt
 import os
 from pathlib import Path
 import re
@@ -18,6 +17,40 @@ import time
 import zipfile
 
 from core import FUNNEL, canonical_origin, load_config, read_json, save_json, uses_funnel
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    class _WinFileBasic(ctypes.Structure):
+        _fields_ = [("created", ctypes.c_longlong), ("accessed", ctypes.c_longlong),
+                    ("written", ctypes.c_longlong), ("changed", ctypes.c_longlong),
+                    ("attributes", wintypes.DWORD)]
+
+    class _WinFileStandard(ctypes.Structure):
+        _fields_ = [("allocated", ctypes.c_longlong), ("size", ctypes.c_longlong),
+                    ("links", wintypes.DWORD), ("delete_pending", ctypes.c_ubyte),
+                    ("directory", ctypes.c_ubyte)]
+
+    class _WinFileId(ctypes.Structure):
+        _fields_ = [("volume", ctypes.c_ulonglong), ("identifier", ctypes.c_ubyte * 16)]
+
+    _kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    _open_win = _kernel.CreateFileW
+    _open_win.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    _open_win.restype = wintypes.HANDLE
+    _win_info = _kernel.GetFileInformationByHandleEx
+    _win_info.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    _win_info.restype = wintypes.BOOL
+    _win_type = _kernel.GetFileType
+    _win_type.argtypes = [wintypes.HANDLE]
+    _win_type.restype = wintypes.DWORD
+    _close_win = _kernel.CloseHandle
+    _close_win.argtypes = [wintypes.HANDLE]
+    _close_win.restype = wintypes.BOOL
+    _INVALID_HANDLE = ctypes.c_void_p(-1).value
 
 DOCUMENT_TYPES = frozenset({".pdf", ".docx", ".zip", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"})
 # Original bytes do not use a preview-format allowlist. Keep key stores and
@@ -128,8 +161,63 @@ def _identity(path):
     return entry
 
 
-def _stat_stamp(entry):
-    return [entry.st_dev, entry.st_ino, entry.st_size, entry.st_mtime_ns, entry.st_ctime_ns]
+def _source_handle_stamp(raw):
+    """Use one representation across queued, opened, and reopened metadata.
+
+    CPython on Windows can obtain path stat and CRT descriptor stat through
+    different APIs, whose inode/device numbers and timestamp precision are not
+    interchangeable. The native file ID/volume and times all come from the
+    same handle query here. The size remains field 2 for queue compatibility.
+    """
+    if os.name != "nt":
+        entry = os.fstat(raw.fileno())
+        if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+            raise ValueError("Original file must be regular, without links")
+        return [entry.st_dev, entry.st_ino, entry.st_size, entry.st_mtime_ns, entry.st_ctime_ns]
+    handle = msvcrt.get_osfhandle(raw.fileno())
+    if _win_type(handle) != 1:  # FILE_TYPE_DISK
+        raise ValueError("Original file must be a regular Windows disk file")
+    basic, standard, ident = _WinFileBasic(), _WinFileStandard(), _WinFileId()
+    for kind, info in ((0, basic), (1, standard), (18, ident)):  # Basic, Standard, FileId
+        if not _win_info(handle, kind, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ValueError("Cannot verify a stable native file identity on this Windows volume")
+    if (basic.attributes & (0x400 | 0x10) or standard.directory or standard.delete_pending
+            or standard.links != 1 or standard.size < 0 or not any(ident.identifier)):
+        raise ValueError("Original file must be regular, without links")
+    return [ident.volume, bytes(ident.identifier).hex(), standard.size,
+            basic.written, basic.changed, basic.created]
+
+
+@contextmanager
+def _open_original(path):
+    if os.name == "nt":
+        handle = _open_win(str(path), 0x80000000, 0x1, None, 3, 0x00200000 | 0x02000000, None)
+        # GENERIC_READ; only FILE_SHARE_READ; OPEN_EXISTING; OPEN_REPARSE_POINT.
+        if handle is None or handle == _INVALID_HANDLE:
+            raise ValueError("Original cannot be pinned for a safe read; close writers and retry")
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+        except BaseException:
+            _close_win(handle)
+            raise
+    else:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        with os.fdopen(fd, "rb", closefd=False) as original:
+            yield original, _source_handle_stamp(original)
+    finally:
+        os.close(fd)
+
+
+def _source_stamp_guarded(path):
+    with _open_original(path) as (_original, stamp):
+        return stamp
+
+
+def _source_stamp(path):
+    from transfer_mailbox import guarded_inbox
+    with guarded_inbox(path.parent):
+        return _source_stamp_guarded(path)
 
 
 def raw_exportable(path):
@@ -166,28 +254,24 @@ def _snapshot_copy(source, target, stamp, limit, observe):
 def _snapshot_copy_guarded(source, target, stamp, limit, observe):
     digest = hashlib.sha256()
     total = 0
-    started = _identity(source)
-    if _stat_stamp(started) != stamp:
-        raise ValueError("Original file changed since submission; start a new export")
-    with source.open("rb") as raw, target.open("xb") as copy:
-        opened = os.fstat(raw.fileno())
-        if _stat_stamp(opened) != stamp or opened.st_nlink != 1:
-            raise ValueError("Original file changed before opening; start a new export")
-        last = time.monotonic()
-        while chunk := raw.read(CHUNK):
-            total += len(chunk)
-            if total > min(limit, stamp[2]):
-                raise ValueError("Original file grew during copy; start a new export")
-            digest.update(chunk)
-            copy.write(chunk)
-            now = time.monotonic()
-            if now - last >= 0.25:
-                observe(total)
-                last = now
-        after = os.fstat(raw.fileno())
-        if total != stamp[2] or after.st_nlink != 1 or _stat_stamp(after) != stamp:
-            raise ValueError("Original file changed during copy; start a new export")
-    if _stat_stamp(_identity(source)) != stamp:
+    with _open_original(source) as (raw, opened):
+        if opened != stamp:
+            raise ValueError("Original file changed since submission; start a new export")
+        with target.open("xb") as copy:
+            last = time.monotonic()
+            while chunk := raw.read(CHUNK):
+                total += len(chunk)
+                if total > min(limit, stamp[2]):
+                    raise ValueError("Original file grew during copy; start a new export")
+                digest.update(chunk)
+                copy.write(chunk)
+                now = time.monotonic()
+                if now - last >= 0.25:
+                    observe(total)
+                    last = now
+            if total != stamp[2] or _source_handle_stamp(raw) != stamp:
+                raise ValueError("Original file changed during copy; start a new export")
+    if _source_stamp_guarded(source) != stamp:
         raise ValueError("Original file was replaced during copy; start a new export")
     observe(total)
     return digest.hexdigest()
@@ -301,18 +385,19 @@ def _download_data(cfg, token, record):
 def snapshot(source, cfg):
     """Compatibility path for <=20 MB prepare_workspace_file calls."""
     source, _ = _source_and_path(source, cfg)
-    initial = _identity(source)
+    initial = _source_stamp(source)
+    size = initial[2]
     limit = min(LEGACY_SYNC_MAX_BYTES, transfer_max_bytes(cfg))
-    if initial.st_size > limit:
+    if size > limit:
         raise ValueError("Use the background original export for files larger than 20,000,000 bytes")
     clear_expired(force=True)
     key = secrets.token_urlsafe(32)
     manifest, target = files(key)
-    record = {"name": source.name, "bytes": initial.st_size, "expires": time.time() + TTL,
+    record = {"name": source.name, "bytes": size, "expires": time.time() + TTL,
               "mime": mimetypes.guess_type(source.name)[0] or "application/octet-stream",
               "policy": policy_fingerprint(cfg), "pending": True}
     with _state_lock():
-        _reserve(initial.st_size, time.time())
+        _reserve(size, time.time())
         save_json(manifest, record)
 
     def permitted(_):
@@ -320,9 +405,9 @@ def snapshot(source, cfg):
             raise ValueError("Document or workspace authorization changed")
 
     try:
-        digest = _snapshot_copy(source, target, _stat_stamp(initial), limit, permitted)
+        digest = _snapshot_copy(source, target, initial, limit, permitted)
         with _state_lock():
-            permitted(initial.st_size)
+            permitted(size)
             record.update(sha256=digest, expires=time.time() + TTL, pending=False)
             save_json(manifest, record)
     except Exception:
@@ -358,8 +443,8 @@ def _status(record):
 def begin_export(source, cfg):
     """Enqueue an original export and return its public status without reading bytes."""
     source, label = _source_and_path(source, cfg)
-    initial = _identity(source)
-    size = initial.st_size
+    initial = _source_stamp(source)
+    size = initial[2]
     limit = transfer_max_bytes(cfg)
     if size > limit:
         raise ValueError(f"Original exceeds the configured {limit:,}-byte transfer limit")
@@ -368,7 +453,7 @@ def begin_export(source, cfg):
     job_id = secrets.token_hex(16)
     first, _, _ = _job_paths(job_id)
     record = {"job_id": job_id, "state": "queued", "file": source.name, "relative_path": label,
-              "stamp": _stat_stamp(initial), "bytes": size, "prepared_bytes": 0,
+              "stamp": initial, "bytes": size, "prepared_bytes": 0,
               "policy": policy_fingerprint(cfg), "created_at": now, "updated_at": now,
               "snapshot_expires_at": now + SNAPSHOT_SECONDS}
     with _state_lock():
@@ -466,24 +551,21 @@ def _archive_copy(source, output, record, observe):
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not raw_exportable(entry):
                     excluded += 1
                     continue
-                stamp = _stat_stamp(info)
-                if total + info.st_size > min(4 * limit, 2_000_000_000):
-                    raise ValueError("ZIP source byte budget exceeded; choose a smaller folder")
                 copied = 0
-                with entry.open("rb") as original, archive.open(arcname, "w") as member:
-                    opened = os.fstat(original.fileno())
-                    if opened.st_nlink != 1 or _stat_stamp(opened) != stamp:
-                        raise ValueError("An archive source changed before opening; retry the job")
-                    while chunk := original.read(CHUNK):
-                        copied += len(chunk)
-                        if copied > info.st_size:
-                            raise ValueError("An archive source grew during packaging; retry the job")
-                        member.write(chunk)
-                        tick(stream)
-                    current = os.fstat(original.fileno())
-                    if copied != info.st_size or current.st_nlink != 1 or _stat_stamp(current) != stamp:
+                with _open_original(entry) as (original, stamp):
+                    size = stamp[2]
+                    if total + size > min(4 * limit, 2_000_000_000):
+                        raise ValueError("ZIP source byte budget exceeded; choose a smaller folder")
+                    with archive.open(arcname, "w") as member:
+                        while chunk := original.read(CHUNK):
+                            copied += len(chunk)
+                            if copied > size:
+                                raise ValueError("An archive source grew during packaging; retry the job")
+                            member.write(chunk)
+                            tick(stream)
+                    if copied != size or _source_handle_stamp(original) != stamp:
                         raise ValueError("An archive source changed during packaging; retry the job")
-                if _stat_stamp(_identity(entry)) != stamp:
+                if _source_stamp_guarded(entry) != stamp:
                     raise ValueError("An archive source was replaced during packaging; retry the job")
                 total += copied
                 included += 1

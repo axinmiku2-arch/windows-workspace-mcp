@@ -241,7 +241,7 @@ mcp = FastMCP("Windows Workspace MCP", auth_server_provider=provider,
               stateless_http=True, json_response=True, max_request_body_size=48_000,
               transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
                   allowed_hosts=[HOST], allowed_origins=[BASE]),
-              auth=AuthSettings(issuer_url=BASE, resource_server_url=RESOURCE,
+              auth=AuthSettings(issuer_url=BASE, resource_server_url=RESOURCE, validate_token_resource=True,
                                 required_scopes=[SCOPE], revocation_options=RevocationOptions(enabled=True),
                                 client_registration_options=ClientRegistrationOptions(
                                     enabled=True, valid_scopes=[SCOPE], default_scopes=[SCOPE])))
